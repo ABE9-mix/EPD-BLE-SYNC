@@ -1,0 +1,11 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# 运行时产物
+service/logs/
+service/state.json
+
+# 本地配置（含设备 MAC，不入库）
+service/config.json
