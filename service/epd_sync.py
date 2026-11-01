@@ -452,12 +452,26 @@ class BleSync:
         city = self.cfg.get("city") or "Hangzhou"
         lang = self.cfg.get("language") or "zh"
         timeout = httpx.Timeout(20.0, connect=10.0)
-        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-            g = geocode(client, city, lang)
-            log.info("城市：%s %s %s (%.4f, %.4f)",
-                     g["name"], g["admin"], g["country"], g["lat"], g["lon"])
-            wx = fetch_weather(client, g["lat"], g["lon"])
-        return build_payload(wx)
+
+        # 国内直连 Open-Meteo 偶尔会被掐连接（WinError 10054）。
+        # 单次抖动不应该让整个同步失败并退避 30 秒，这里就地重试 3 次。
+        last_err: Exception | None = None
+        for attempt in range(3):
+            try:
+                with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+                    g = geocode(client, city, lang)
+                    log.info("城市：%s %s %s (%.4f, %.4f)",
+                             g["name"], g["admin"], g["country"], g["lat"], g["lon"])
+                    wx = fetch_weather(client, g["lat"], g["lon"])
+                return build_payload(wx)
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                if attempt < 2:
+                    wait = 1.5 * (attempt + 1)
+                    log.warning("取天气失败（第 %d 次）：%s，%.1fs 后重试",
+                                attempt + 1, e, wait)
+                    time.sleep(wait)
+        raise last_err if last_err else RuntimeError("取天气失败")
 
     async def _push(self, payload: dict) -> bool:
         dev = await self._find_device()

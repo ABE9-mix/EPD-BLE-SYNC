@@ -142,7 +142,14 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
 }
 
 $action = New-ScheduledTaskAction -Execute $PyExe -Argument "`"$Script`"" -WorkingDirectory $BaseDir
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+
+# 两个触发器：
+#   ① 登录时启动（主入口）
+#   ② 每 30 分钟重复一次（自愈）：配合 -MultipleInstances IgnoreNew，
+#      进程活着就忽略本次触发，进程挂了就顺手拉起来，不用等下次登录。
+$triggerLogon  = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+$triggerRepeat = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(2)) `
+    -RepetitionInterval (New-TimeSpan -Minutes 30)
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
@@ -154,11 +161,13 @@ $settings = New-ScheduledTaskSettingsSet `
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" `
     -LogonType Interactive -RunLevel Limited
 
-Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
+Register-ScheduledTask -TaskName $TaskName -Action $action `
+    -Trigger @($triggerLogon, $triggerRepeat) `
     -Settings $settings -Principal $principal `
     -Description 'ESP32 墨水屏天气站 BLE 自动同步（用户登录后后台运行）' | Out-Null
 
-Write-Host "已注册计划任务：$TaskName（登录时自动启动，不显示窗口）" -ForegroundColor Green
+Write-Host "已注册计划任务：$TaskName" -ForegroundColor Green
+Write-Host "  触发：登录时 + 每 30 分钟自愈检查（进程活着会忽略）"
 
 if (-not $NoStart) {
     Start-ScheduledTask -TaskName $TaskName
