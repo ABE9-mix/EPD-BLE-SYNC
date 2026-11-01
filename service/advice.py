@@ -19,7 +19,8 @@ from typing import List
 PHRASES = {
     # 下雨
     "rain_in":      "{n}小时后有雨",     # n 为 1~9
-    "rain_soon":    "即将下雨",
+    # 注意：不要用「即」——方舟像素 12px 的 zh_hans 子集里该码位是缺字方框
+    "rain_soon":    "正在下雨",
     "rain_today":   "今日有雨",
     "rain_tmrw":    "明日有雨",
     "snow_tmrw":    "明日有雪",

@@ -19,16 +19,18 @@ COL_SPLIT_X = 80
 RIGHT_PAD_X = 84
 CELL = 12
 
-ENTRY = re.compile(r"\{0x([0-9A-Fa-f]{4}), \{([^}]*)\}\}")
+ENTRY = re.compile(r"\{0x([0-9A-Fa-f]{4}),\s*(\d+),\s*\{([^}]*)\}\}")
 
 
-def load_glyphs() -> dict[int, list[int]]:
+def load_glyphs() -> dict[int, tuple[int, list[int]]]:
+    """返回 {码位: (字宽, 行位图)}。"""
     text = HEADER.read_text(encoding="utf-8")
     out = {}
     for m in ENTRY.finditer(text):
         cp = int(m.group(1), 16)
-        vals = [int(v, 16) for v in m.group(2).split(",") if v.strip()]
-        out[cp] = [(vals[i] << 8) | vals[i + 1] for i in range(0, len(vals), 2)]
+        w = int(m.group(2))
+        vals = [int(v, 16) for v in m.group(3).split(",") if v.strip()]
+        out[cp] = (w, [(vals[i] << 8) | vals[i + 1] for i in range(0, len(vals), 2)])
     return out
 
 
@@ -83,10 +85,11 @@ class Canvas:
                         self.px(x, y)
 
     def char(self, x, y, cp, scale=1):
-        rows = G.get(cp)
-        if rows is None:
+        ent = G.get(cp)
+        if ent is None:
             self.rect(x + 1, y + 1, CELL - 2, CELL - 2)
-            return
+            return CELL
+        w, rows = ent
         for r, bits in enumerate(rows):
             for c in range(CELL):
                 if bits & (1 << (CELL - 1 - c)):
@@ -94,12 +97,21 @@ class Canvas:
                         self.px(x + c, y + r)
                     else:
                         self.fill_rect(x + c * scale, y + r * scale, scale, scale)
+        return w
 
     def text(self, x, y, s, scale=1):
         cx = x
         for ch in s:
-            self.char(cx, y, ord(ch), scale)
-            cx += CELL * scale
+            adv = self.char(cx, y, ord(ch), scale)
+            cx += (adv or CELL) * scale
+        return cx - x
+
+    def text_width(self, s, scale=1):
+        w = 0
+        for ch in s:
+            ent = G.get(ord(ch))
+            w += (ent[0] if ent else CELL)
+        return w * scale
 
 
 def draw_icon(c: Canvas, cx: int, cy: int, code: int):
@@ -139,28 +151,33 @@ def render(temp: str, code: int, uv: str, a1: str, a2: str, a3: str,
            forecast: str, out_path: Path):
     c = Canvas()
 
+    LEFT_CX = 40
     # 分隔点线
-    for y in range(8, 96, 4):
+    for y in range(6, 98, 4):
         c.px(COL_SPLIT_X - 1, y)
         c.px(COL_SPLIT_X - 1, y + 1)
 
-    draw_icon(c, 24, 28, code)
+    draw_icon(c, LEFT_CX, 22, code)
 
-    c.text(8, 62, f"UV{uv}")
+    uv_s = f"UV{uv}"
+    c.text(LEFT_CX - c.text_width(uv_s) // 2, 46, uv_s)
 
-    # 温度放大 2 倍（baseY=76，24px 高，不会裁底）
-    c.text(8, 76, temp, scale=2)
+    # 温度 24px（12px×2），含 °C，水平居中
+    t_s = temp if "°" in temp else f"{temp}°C"
+    tw = c.text_width(t_s, scale=2)
+    tx = max(2, LEFT_CX - tw // 2)
+    c.text(tx, 72, t_s, scale=2)
 
-    ry = 16
+    ry = 12
     for line in (a1, a2):
         if line:
             c.text(RIGHT_PAD_X, ry, line)
             ry += CELL + 10
 
     if forecast:
-        c.line(RIGHT_PAD_X, 74, RIGHT_PAD_X + 96, 74)
-        # 与固件一致：forecast 已是完整字符串（含"明日"前缀）
-        c.text(RIGHT_PAD_X, 80, forecast)
+        c.line(RIGHT_PAD_X, 68, RIGHT_PAD_X + 112, 68)
+        # forecast 已是完整字符串（含"明日"前缀），与固件一致
+        c.text(RIGHT_PAD_X, 84, forecast)
 
     # 加粗边框，模拟墨水屏边界
     img = c.img

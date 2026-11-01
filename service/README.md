@@ -54,7 +54,37 @@ cd F:\AIchat\epd_ble\service
 
 ---
 
-## 三、配置
+## 三、城市怎么设置（重点）
+
+**电脑服务和手机网页的城市是两套，互不影响。** 因为它们跑在不同设备上：
+
+| 谁在推天气 | 城市存在哪 | 怎么改 |
+|---|---|---|
+| **Windows 服务**（电脑常驻） | `F:\AIchat\epd_ble\service\config.json` 的 `city` | 改文件后重启任务 |
+| **手机网页**（浏览器） | 浏览器 localStorage 的 `epd_city` | 在页面输入框里改，点同步即记住 |
+
+两处各存各的，谁推就按谁的城市。**设备端不存城市**——它只接收最终结果。
+
+改服务的城市，三种方式任选：
+
+```powershell
+# ① 直接编辑配置文件（最简单）
+notepad F:\AIchat\epd_ble\service\config.json
+# 把 "city": "Hangzhou" 改成 "city": "杭州"，然后：
+Stop-ScheduledTask  -TaskName EPD-Weather-Sync
+Start-ScheduledTask -TaskName EPD-Weather-Sync
+
+# ② 重装时指定
+.\install_task.ps1 -City 杭州
+
+# ③ 临时手动跑一次验证
+.\.venv\Scripts\python.exe epd_sync.py --once --city 上海
+```
+
+> 城市名支持中文（`杭州`）和拼音（`Hangzhou`）。
+> 查不到的城市会报 `找不到城市`——换成更通用的名称。
+
+### 其他配置项
 
 `config.json`：
 
@@ -67,13 +97,7 @@ cd F:\AIchat\epd_ble\service
 | `scan_timeout_s` | `12` | 扫描超时 |
 | `only_when_changed` | `true` | 天气无变化时不写屏 |
 | `retry_backoff_s` | `[30,60,120,300,600]` | 失败退避序列 |
-
-改完不用重装，重启任务即可：
-
-```powershell
-Stop-ScheduledTask  -TaskName EPD-Weather-Sync
-Start-ScheduledTask -TaskName EPD-Weather-Sync
-```
+| `startup_delay_s` | `8` | 开机后等多久再开始（避开开机高峰） |
 
 ---
 

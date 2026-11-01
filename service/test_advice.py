@@ -79,7 +79,10 @@ for n in range(1, 10):
     check(f"{n}小时后有雨", lines[0] == f"{n}小时后有雨", lines[0])
 lines = A.build_advice({"rain_in_hours": 0, "uv": 0, "temp": 20,
                         "thigh": 25, "tlow": 15, "hum": 50, "wind": 0})
-check("正在下雨 -> 即将下雨", lines[0] == "即将下雨", lines[0])
+check("正在下雨 -> 正在下雨", lines[0] == "正在下雨", lines[0])
+# 回归防护：字体 zh_hans 子集里「即」是缺字方框，任何文案都不许用它
+check("文案不含缺字「即」", "即" not in "".join(A.PHRASES.values()),
+      [t for t in A.PHRASES.values() if "即" in t])
 
 print("\n== 3. 明日预告 ==")
 lines = A.build_advice({"rain_in_hours": None, "uv": 1, "temp": 20, "thigh": 25,
