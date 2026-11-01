@@ -189,9 +189,30 @@
   </p>
 </div>
 
+<!-- ============ 自动同步 ============ -->
+<div class="card">
+  <h2>3 · 自动同步</h2>
+
+  <label class="row" style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
+    <input type="checkbox" id="autoSync" checked />
+    <span>开启自动同步（连上即同步一次，之后每 30 分钟一次；设备请求时立即同步）</span>
+  </label>
+
+  <dl class="kv">
+    <dt>下次自动同步</dt><dd id="autoNext">未连接</dd>
+    <dt>同步状态</dt><dd id="autoState">待机</dd>
+  </dl>
+
+  <p class="tip" style="margin-top:10px">
+    说明：页面必须<b>保持在后台运行</b>（可以切到别的 App，但别关掉这个标签页）。
+    ESP32 是蓝牙外设，不能自己上网，所以要靠手机端定时推送。
+    手机锁屏久了浏览器会节流定时器，<b>重新打开页面会自动补一次</b>。
+  </p>
+</div>
+
 <!-- ============ 结果 ============ -->
 <div class="card">
-  <h2>3 · 状态与排错</h2>
+  <h2>4 · 状态与排错</h2>
 
   <dl class="kv">
     <dt>最后同步</dt><dd id="metaLast">—</dd>
@@ -287,6 +308,7 @@ const el = {
   compat: $("compat"),
   city: $("city"), btnSync: $("btnSync"), btnTestJson: $("btnTestJson"), btnClear: $("btnClear"),
   metaLast: $("metaLast"), metaBytes: $("metaBytes"), metaChunks: $("metaChunks"), metaReply: $("metaReply"),
+  autoSync: $("autoSync"), autoNext: $("autoNext"), autoState: $("autoState"),
   outPayload: $("outPayload"), outRaw: $("outRaw"), outLog: $("outLog")
 };
 
@@ -427,6 +449,15 @@ let txChar = null;     // notify 用
 let notifyBuf = "";    // notify 字节流缓冲（按 \n 切行）
 const replyWaiters = []; // 等待回执的 Promise resolver 队列
 
+/* ---------- 自动同步状态 ---------- */
+let syncing = false;          // 防止并发同步
+let lastSyncAt = 0;           // 上次成功同步的时间戳
+let autoTimer = null;         // 定时器
+let autoEnabled = true;       // 自动同步开关
+let reconnectTimer = null;    // 断线重连定时器
+const AUTO_INTERVAL_MS = 30 * 60 * 1000;   // 默认 30 分钟一次
+const RECONNECT_DELAY_MS = 5000;           // 断线后 5 秒重试
+
 function setConn(state, text, name) {
   el.connDot.className = "dot" + (state ? " " + state : "");
   el.connText.textContent = text;
@@ -440,6 +471,26 @@ function setConnectedUI(connected) {
   el.btnStatus.disabled = !connected;
   el.btnSync.disabled = !connected;
   el.btnTestJson.disabled = !connected;
+}
+
+/** 取 RX/TX 两个特征并订阅 notify。连接与重连共用。 */
+async function bindChars(server) {
+  const service = await server.getPrimaryService(NUS_SERVICE);
+  log("拿到 NUS 服务");
+
+  rxChar = await service.getCharacteristic(NUS_RX);
+  txChar = await service.getCharacteristic(NUS_TX);
+  log(`RX properties: ${[...(rxChar.properties ? Object.keys(rxChar.properties).filter(k => rxChar.properties[k]) : [])].join(",")}`);
+
+  // 订阅 TX 通知（设备回执 / 状态查询回复 / need_sync 请求都从这里来）
+  try {
+    await txChar.startNotifications();
+    txChar.addEventListener("characteristicvaluechanged", onNotify);
+    log("已订阅 TX notify");
+  } catch (e) {
+    log("⚠️ 订阅 TX notify 失败（写入仍可进行）：" + e.message);
+  }
+  btServer = server;
 }
 
 /** 连接流程：requestDevice -> gatt.connect -> 取 RX/TX -> 订阅 notify。 */
@@ -462,28 +513,19 @@ async function connectDevice() {
     btDevice.addEventListener("gattserverdisconnected", onDisconnected);
 
     setConn("wait", "正在连接 GATT…", btDevice.name);
-    btServer = await btDevice.gatt.connect();
+    const server = await btDevice.gatt.connect();
     log("GATT 已连接");
 
-    const service = await btServer.getPrimaryService(NUS_SERVICE);
-    log("拿到 NUS 服务");
-
-    rxChar = await service.getCharacteristic(NUS_RX);
-    txChar = await service.getCharacteristic(NUS_TX);
-    log(`RX properties: ${[...(rxChar.properties ? Object.keys(rxChar.properties).filter(k => rxChar.properties[k]) : [])].join(",")}`);
-
-    // 订阅 TX 通知（设备回执 / 状态查询回复都从这里来）
-    try {
-      await txChar.startNotifications();
-      txChar.addEventListener("characteristicvaluechanged", onNotify);
-      log("已订阅 TX notify");
-    } catch (e) {
-      log("⚠️ 订阅 TX notify 失败（写入仍可进行）：" + e.message);
-    }
+    await bindChars(server);
 
     setConn("on", "已连接", btDevice.name || "(无名设备)");
     setConnectedUI(true);
     log("连接完成，可以同步天气");
+
+    // 连上就自动同步一次，并开启定时同步
+    autoEnabled = true;
+    startAutoSync();
+    syncWeather(true);
   } catch (err) {
     setConn("bad", "连接失败");
     setConnectedUI(false);
@@ -502,12 +544,93 @@ function onDisconnected() {
   setConnectedUI(false);
   rxChar = txChar = null;
   btServer = null;
+  stopAutoSync();
+  // 自动重连：设备重启/走远后回来能自动续上，无需人工点
+  if (autoEnabled && btDevice) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(() => {
+      log("尝试自动重连…");
+      autoReconnect();
+    }, RECONNECT_DELAY_MS);
+  }
+}
+
+/** 静默重连（不弹配对框，复用已授权的 device）。 */
+async function autoReconnect() {
+  if (!btDevice || rxChar) return;
+  try {
+    const server = await btDevice.gatt.connect();
+    await bindChars(server);
+    setConnectedUI(true);
+    setConn("on", "已重连", btDevice.name || "");
+    log("自动重连成功");
+    startAutoSync();            // 恢复定时
+    if (autoEnabled) syncWeather(true);   // 立刻补一次数据
+  } catch (e) {
+    log("自动重连失败：" + e.message + "（稍后再试）");
+    if (autoEnabled && btDevice) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(autoReconnect, RECONNECT_DELAY_MS * 3);
+    }
+  }
 }
 
 function disconnectDevice() {
+  autoEnabled = false;         // 手动断开就不要自动重连
+  stopAutoSync();
+  clearTimeout(reconnectTimer);
   try { if (btServer && btServer.connected) btServer.disconnect(); } catch (e) { /* ignore */ }
   onDisconnected();
 }
+
+/* ============================================================================
+ * 5b. 自动同步引擎
+ * --------------------------------------------------------------------------
+ * 两条触发路径：
+ *   ① 定时器：每 AUTO_INTERVAL_MS 主动推一次
+ *   ② 设备请求：设备发现数据过期会 notify {"cmd":"need_sync"}，立即推
+ * 断线后自动重连，重连成功立刻补一次。
+ * ==========================================================================*/
+function startAutoSync() {
+  stopAutoSync();
+  if (!autoEnabled) return;
+  autoTimer = setInterval(() => {
+    if (!autoEnabled || !rxChar) return;
+    log("[自动] 定时同步触发");
+    syncWeather(true);
+  }, AUTO_INTERVAL_MS);
+  refreshAutoNext();
+}
+
+function stopAutoSync() {
+  if (autoTimer) { clearInterval(autoTimer); autoTimer = null; }
+  refreshAutoNext();
+}
+
+/** 把"下次自动同步时间"显示出来，让用户知道它真的在跑。 */
+function refreshAutoNext() {
+  if (!el.autoNext) return;
+  if (!autoEnabled) { el.autoNext.textContent = "已关闭"; return; }
+  if (!rxChar) { el.autoNext.textContent = "未连接"; return; }
+  if (!autoTimer) { el.autoNext.textContent = "已暂停"; return; }
+  const base = lastSyncAt || Date.now();
+  const next = new Date(base + AUTO_INTERVAL_MS);
+  const hh = String(next.getHours()).padStart(2, "0");
+  const mm = String(next.getMinutes()).padStart(2, "0");
+  el.autoNext.textContent = `${hh}:${mm}`;
+}
+
+/** 页面切回前台时，如果数据太旧就补一次（手机锁屏后定时器会被节流）。 */
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") return;
+  if (!autoEnabled || !rxChar) return;
+  const age = Date.now() - (lastSyncAt || 0);
+  if (age > AUTO_INTERVAL_MS) {
+    log("[自动] 页面回到前台，数据已过期，补一次同步");
+    syncWeather(true);
+  }
+  refreshAutoNext();
+});
 
 /* ============================================================================
  * 6. notify 接收：按 \n 切行，逐行 parse JSON；有等待者就 resolve
@@ -527,6 +650,18 @@ function onNotify(event) {
     try { parsed = JSON.parse(line); } catch (e) { /* 非 JSON 也照样展示 */ }
 
     el.metaReply.textContent = parsed ? JSON.stringify(parsed) : line;
+
+    // 设备主动请求同步（连上时 / 数据过期时都会发）
+    if (parsed && parsed.cmd === "need_sync") {
+      log(`[自动] 设备请求同步（${parsed.reason || "unknown"}）`);
+      if (autoEnabled && rxChar) {
+        // 稍等一下，确保这次 notify 处理完再写，避免抢占
+        setTimeout(() => syncWeather(true), 300);
+      }
+      continue;   // 这是请求不是回执，不要喂给等待者
+    }
+    // pong 之类的心跳不是回执
+    if (parsed && parsed.msg === "connected") continue;
 
     // 唤醒第一个等待回执的调用
     const w = replyWaiters.shift();
@@ -685,6 +820,7 @@ function buildPayload(city, wx) {
   const dCode = daily.weather_code || [];
 
   const payload = {};
+  payload.epoch = Math.floor(Date.now() / 1000);   // 顺带校准设备时钟
 
   const temp = safeInt(cur.temperature_2m);
   if (temp !== null) payload.temp = temp;
@@ -725,19 +861,28 @@ function buildPayload(city, wx) {
   return { payload, city };
 }
 
-/** 主流程：城市 -> 经纬度 -> 天气 -> 组装 JSON -> 分片写入 -> 等回执。 */
-async function syncWeather() {
+/** 主流程：城市 -> 经纬度 -> 天气 -> 组装 JSON -> 分片写入 -> 等回执。
+ *  auto=true 表示由自动同步触发（不弹窗、失败时安静重试、不占用按钮）。 */
+async function syncWeather(auto = false) {
   const cityName = (el.city.value || "").trim();
-  if (!cityName) { log("请先输入城市名"); el.city.focus(); return; }
-  if (!rxChar) { log("请先连接设备"); return; }
+  if (!cityName) {
+    if (!auto) { log("请先输入城市名"); el.city.focus(); }
+    return;
+  }
+  if (!rxChar) {
+    if (!auto) log("请先连接设备");
+    return;
+  }
+  if (syncing) { log("已有同步在进行，跳过本次"); return; }
+  syncing = true;
 
   el.btnSync.disabled = true;
   try {
     localStorage.setItem("epd_city", cityName);
 
-    setConn("wait", "正在取天气…", btDevice ? btDevice.name : "");
+    setConn("wait", auto ? "自动同步中…" : "正在取天气…", btDevice ? btDevice.name : "");
     const city = await geocodeCity(cityName);
-    log(`城市解析：${city.name} ${city.admin} ${city.country} (${city.lat}, ${city.lon})`);
+    log(`${auto ? "[自动] " : ""}城市解析：${city.name} ${city.admin} ${city.country} (${city.lat}, ${city.lon})`);
 
     const wx = await fetchForecast(city.lat, city.lon);
     const { payload } = buildPayload(city, wx);
@@ -756,12 +901,18 @@ async function syncWeather() {
       log("⚠️ 等待回执超时（写入可能已成功，设备不回执也不影响刷新）");
     }
 
+    lastSyncAt = Date.now();
+    refreshAutoNext();
+    if (el.autoState) el.autoState.textContent = "正常";
+
     // 只在仍连着的时候刷新连接状态文案：如果中途被断开，就别把状态改回"已连接"
-    if (rxChar) setConn("on", "已连接 · 同步完成", btDevice ? btDevice.name : "");
+    if (rxChar) setConn("on", auto ? "已连接 · 自动同步完成" : "已连接 · 同步完成",
+                        btDevice ? btDevice.name : "");
   } catch (err) {
     log("❌ 同步失败：" + (err && err.message ? err.message : String(err)));
     if (rxChar) setConn("on", "已连接 · 同步失败", btDevice ? btDevice.name : "");
   } finally {
+    syncing = false;
     el.btnSync.disabled = !rxChar;
   }
 }
@@ -821,6 +972,20 @@ el.btnClear.addEventListener("click", () => {
 });
 el.city.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && rxChar) syncWeather();
+});
+
+// 自动同步开关
+el.autoSync.checked = true;
+el.autoSync.addEventListener("change", () => {
+  autoEnabled = el.autoSync.checked;
+  el.autoState.textContent = autoEnabled ? "已开启" : "已关闭";
+  if (autoEnabled) {
+    if (rxChar) startAutoSync();
+  } else {
+    stopAutoSync();
+  }
+  log(autoEnabled ? "自动同步：开启" : "自动同步：关闭");
+  refreshAutoNext();
 });
 
 (function init() {
