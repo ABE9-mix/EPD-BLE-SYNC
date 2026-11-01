@@ -790,12 +790,15 @@ async function geocodeCity(name) {
 }
 
 async function fetchForecast(lat, lon) {
-  // current / daily 变量：基础 4 个 + uv_index（追加项，已实测可用）
-  const currentVars = "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,uv_index";
+  // current / daily 变量：基础 4 个 + uv_index / wind（追加项，已实测可用）
+  const currentVars = "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,uv_index,wind_speed_10m";
   const dailyVars  = "temperature_2m_max,temperature_2m_min,weather_code,uv_index_max";
+  // v4：hourly 只取两个变量，用于「几小时后有雨」
+  const hourlyVars = "precipitation_probability,weather_code";
 
   const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
-              `&current=${currentVars}&daily=${dailyVars}&timezone=auto&forecast_days=2`;
+              `&current=${currentVars}&daily=${dailyVars}&hourly=${hourlyVars}` +
+              `&timezone=auto&forecast_days=2`;
   log("请求天气：" + url);
 
   const res = await fetch(url, { method: "GET" });
@@ -858,7 +861,79 @@ function buildPayload(city, wx) {
   if (fcLow !== null) payload.fc_low = fcLow;
   if (fcHigh !== null) payload.fc_high = fcHigh;
 
+  // v4：中文建议（右栏）。与固件字库 advice.py 使用同一套短语，避免缺字。
+  const adv = buildAdvice(wx);
+  if (adv[0]) payload.a1 = adv[0];
+  if (adv[1]) payload.a2 = adv[1];
+
   return { payload, city };
+}
+
+/* 生成中文建议 —— 与 service/advice.py 的 PHRASES 保持一致。
+   每行 ≤10 个汉字（右栏 132px / 12px 字宽）。
+   注意：这些字必须都在固件 font_zh12.h 字库内，否则会显示方框。 */
+function buildAdvice(wx) {
+  const cur = wx.current || {};
+  const daily = wx.daily || {};
+  const hourly = wx.hourly || {};
+  const tLow = safeInt((daily.temperature_2m_min || [])[0]);
+  const tHigh = safeInt((daily.temperature_2m_max || [])[0]);
+  const tmrw = (daily.weather_code || [])[1];
+  const uv = safeInt(cur.uv_index) || 0;
+  const hum = safeInt(cur.relative_humidity_2m) || 0;
+  const wind = cur.wind_speed_10m || 0;
+
+  const RAIN = new Set([51,53,55,56,57,61,63,65,66,67,80,81,82,95,96,99]);
+  const rainIn = rainInHours(hourly, RAIN);
+
+  const out = [];
+  const add = (s) => { if (s && out.length < 2 && !out.includes(s)) out.push(s.slice(0, 10)); };
+
+  // 第 1 行
+  if (rainIn !== null && rainIn >= 1 && rainIn <= 9) add(`${rainIn}小时后有雨`);
+  else if (rainIn === 0) add("即将下雨");
+  else if (uv >= 8) add("紫外线很强");
+  else if (uv >= 6) add("紫外线强");
+  else if (tHigh !== null && tHigh >= 33) add("高温注意补水");
+  else if (tLow !== null && tLow <= 2) add("低温注意保暖");
+  else if (wind >= 30) add("风力较大");
+  else if (hum >= 85) add("湿度较大");
+  else if (hum <= 25) add("空气干燥");
+  else add("天气不错");
+
+  // 第 2 行
+  if (rainIn !== null && rainIn >= 0 && rainIn <= 9) add("记得带伞");
+  else if (uv >= 6) add("注意防晒");
+  else if (tHigh !== null && tHigh >= 33) add("注意补水");
+  else if (tLow !== null && tLow <= 2) add("适当加衣");
+  else if (wind >= 30) add("注意防风");
+  else if (tHigh !== null && tLow !== null && (tHigh - tLow) >= 12) add("温差大注意加衣");
+  else add("适合外出");
+
+  return out;
+}
+
+/** 未来几小时会下雨？返回小时数（1-9），正在下雨返回 0，否则 null。 */
+function rainInHours(hourly, RAIN) {
+  const times = hourly.time || [];
+  const codes = hourly.weather_code || [];
+  const probs = hourly.precipitation_probability || [];
+  if (!times.length || !codes.length) return null;
+
+  // 找当前小时在 hourly 里的下标
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  const key = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}T${pad(now.getHours())}:00`;
+  let idx = times.indexOf(key);
+  if (idx < 0) idx = 0;
+
+  if (RAIN.has(codes[idx])) return 0;
+  for (let step = 1; step <= 9; step++) {
+    const j = idx + step;
+    if (j >= codes.length || j >= probs.length) break;
+    if (RAIN.has(codes[j]) || (typeof probs[j] === "number" && probs[j] >= 60)) return step;
+  }
+  return null;
 }
 
 /** 主流程：城市 -> 经纬度 -> 天气 -> 组装 JSON -> 分片写入 -> 等回执。

@@ -66,6 +66,9 @@ WMO_ICON = {
     95: 200, 96: 200, 99: 200,
 }
 
+# 哪些 WMO 码算"下雨/下雪"（用于"几小时后有雨"判断）
+RAIN_CODES = {51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82, 95, 96, 99}
+
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 LOG_DIR = BASE_DIR / "logs"
@@ -157,13 +160,48 @@ def fetch_weather(client: httpx.Client, lat: float, lon: float) -> dict:
     params = {
         "latitude": lat, "longitude": lon,
         "current": ("temperature_2m,apparent_temperature,relative_humidity_2m,"
-                    "weather_code,uv_index"),
+                    "weather_code,uv_index,wind_speed_10m"),
+        # 加 hourly 用于判断"几小时后有雨"
+        "hourly": "precipitation_probability,weather_code",
         "daily": "temperature_2m_max,temperature_2m_min,weather_code",
         "timezone": "auto", "forecast_days": 2,
     }
     r = client.get(WX_URL, params=params)
     r.raise_for_status()
     return r.json()
+
+
+def _rain_in_hours(wx: dict) -> int | None:
+    """判断未来几小时会下雨。返回小时数（1~9），已在雨里返回 0，否则 None。"""
+    hourly = wx.get("hourly") or {}
+    codes = hourly.get("weather_code") or []
+    probs = hourly.get("precipitation_probability") or []
+    times = hourly.get("time") or []
+    if not codes or not times:
+        return None
+
+    # 找到"当前小时"在 hourly 里的位置
+    now_key = time.strftime("%Y-%m-%dT%H:00", time.localtime())
+    idx = None
+    for i, t in enumerate(times):
+        if str(t) == now_key:
+            idx = i
+            break
+    if idx is None:
+        # 时区/日期对不上时退化：取第一个
+        idx = 0
+
+    cur_code = codes[idx] if idx < len(codes) else None
+    if cur_code in RAIN_CODES:
+        return 0
+
+    for step in range(1, 10):
+        j = idx + step
+        if j >= len(codes) or j >= len(probs):
+            break
+        if codes[j] in RAIN_CODES or (isinstance(probs[j], (int, float)) and probs[j] >= 60):
+            return step
+    return None
 
 
 def build_payload(wx: dict) -> dict:
@@ -210,6 +248,27 @@ def build_payload(wx: dict) -> dict:
         v = _safe_int(tmax[1])
         if v is not None:
             p["fc_high"] = v
+
+    # ---------- v4：中文建议（右栏）----------
+    try:
+        import advice as _adv
+        rain_in = _rain_in_hours(wx)
+        uv_val = _safe_int(cur.get("uv_index")) or 0
+        wind = cur.get("wind_speed_10m")
+        lines = _adv.build_advice({
+            "rain_in_hours": rain_in,
+            "uv": uv_val,
+            "temp": p.get("temp"),
+            "thigh": p.get("thigh"),
+            "tlow": p.get("tlow"),
+            "hum": p.get("hum") or 0,
+            "wind": wind if isinstance(wind, (int, float)) else 0,
+            "tmrw_code": dcode[1] if len(dcode) > 1 else None,
+        })
+        for i, line in enumerate(lines[:2], start=1):
+            p[f"a{i}"] = line
+    except Exception as e:  # noqa: BLE001
+        log.warning("生成中文建议失败：%s", e)
 
     return p
 

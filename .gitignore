@@ -9,3 +9,6 @@ service/state.json
 
 # 本地配置（含设备 MAC，不入库）
 service/config.json
+
+# 字体压缩包（解压后只保留 ttf）
+assets/*.zip
