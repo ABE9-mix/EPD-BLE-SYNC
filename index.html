@@ -1,0 +1,843 @@
+<!DOCTYPE html>
+<!--
+  ============================================================================
+  ESP32-S3 三色墨水屏（EPD 212x104）天气站 —— 手机端 BLE 数据同步客户端
+  ============================================================================
+  单文件实现：原生 HTML + 内联 CSS + 原生 JS，无框架、无构建、无 CDN。
+    - 蓝牙：Web Bluetooth API（navigator.bluetooth），走 Nordic UART Service
+    - 天气：Open-Meteo（免费、无需 API Key、响应头 Access-Control-Allow-Origin: *）
+    - 协议：UTF-8 JSON，手机 -> 设备写入 RX 特征值，设备 -> 手机 TX notify 回执
+
+  ⚠️ 运行前提（页面里也会动态检测并提示）：
+    1) 浏览器必须是 Chrome / Edge（桌面版或 Android 版）。
+       - iOS / iPadOS 的 Safari 完全不支持 Web Bluetooth（WebKit 未实现），
+         第三方浏览器在 iOS 上也都是 Safari 内核，同样不可用。
+       - Firefox 默认不支持 Web Bluetooth。
+    2) 必须是安全上下文：https 页面，或 http://localhost / http://127.0.0.1。
+       直接双击用 file:// 打开【不行】，navigator.bluetooth 会是 undefined。
+       本地起服务：在 web 目录执行 `python -m http.server 8000`，
+       然后访问 http://localhost:8000 。
+    3) 需要用户手势触发 requestDevice（必须由点击事件调用，不能在定时器里调用）。
+
+  协议常量（与固件一致，勿改）：
+    Service : 6e400001-b5a3-f393-e0a9-e50e24dcca9e
+    RX(写)  : 6e400002-b5a3-f393-e0a9-e50e24dcca9e
+    TX(通知): 6e400003-b5a3-f393-e0a9-e50e24dcca9e
+    设备名  : EPD-Weather
+    分片    : 180 字节/片，最后一片追加 '\n' 作为结束符
+-->
+
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>EPD-Weather · 墨水屏天气同步</title>
+<style>
+  /* ---------- 深色简洁主题 ---------- */
+  :root{
+    --bg:#0e1116;
+    --panel:#161b22;
+    --panel-2:#1c232c;
+    --line:#28313d;
+    --txt:#e6edf3;
+    --muted:#8b98a5;
+    --accent:#4aa8ff;
+    --ok:#3fb950;
+    --warn:#d29922;
+    --err:#f85149;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:var(--bg);color:var(--txt);
+    font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    padding:16px 14px 48px;
+    max-width:760px;margin:0 auto;
+    -webkit-text-size-adjust:100%;
+  }
+  h1{font-size:19px;margin:0 0 4px}
+  .sub{color:var(--muted);font-size:12.5px;margin:0 0 16px}
+  .card{
+    background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:14px;margin:0 0 12px;
+  }
+  .card h2{
+    font-size:13px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;
+    color:var(--muted);margin:0 0 10px;
+  }
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .row + .row{margin-top:10px}
+  button{
+    appearance:none;border:1px solid var(--line);background:var(--panel-2);color:var(--txt);
+    padding:11px 15px;border-radius:9px;font-size:14.5px;font-weight:500;
+    cursor:pointer;transition:.15s;flex:0 0 auto;min-height:44px;
+  }
+  button:hover:not(:disabled){border-color:#3c4a5a;background:#222b36}
+  button:disabled{opacity:.42;cursor:not-allowed}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#04121f;font-weight:600}
+  button.primary:hover:not(:disabled){background:#6bbaff;border-color:#6bbaff}
+  button.ghost{background:transparent}
+  input[type=text]{
+    flex:1 1 160px;min-width:0;background:var(--panel-2);border:1px solid var(--line);
+    color:var(--txt);border-radius:9px;padding:11px 12px;font-size:15px;min-height:44px;
+  }
+  input[type=text]:focus{outline:none;border-color:var(--accent)}
+  label.chk{display:flex;gap:8px;align-items:center;color:var(--muted);font-size:13px;cursor:pointer}
+  input[type=checkbox]{width:17px;height:17px;accent-color:var(--accent)}
+
+  /* ---------- 状态条 ---------- */
+  .state{display:flex;align-items:center;gap:9px;font-size:14px}
+  .dot{width:9px;height:9px;border-radius:50%;background:#4b5563;flex:0 0 auto}
+  .dot.on{background:var(--ok);box-shadow:0 0 0 3px rgba(63,185,80,.16)}
+  .dot.wait{background:var(--warn);animation:pulse 1.1s infinite}
+  .dot.bad{background:var(--err)}
+  @keyframes pulse{50%{opacity:.35}}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:13px;margin-top:10px}
+  .kv dt{color:var(--muted)}
+  .kv dd{margin:0;font-family:var(--mono);font-size:12.5px;word-break:break-all}
+
+  /* ---------- 提示 / 警告 ---------- */
+  .note{
+    border-left:3px solid var(--accent);background:rgba(74,168,255,.08);
+    padding:10px 12px;border-radius:0 8px 8px 0;font-size:13px;color:#cfe3f7;
+  }
+  .note.warn{border-color:var(--warn);background:rgba(210,153,34,.09);color:#f0d9a8}
+  .note.err{border-color:var(--err);background:rgba(248,81,73,.09);color:#ffc9c5}
+  .note code,.kv code{font-family:var(--mono);background:#0b0f14;padding:1px 5px;border-radius:4px;font-size:12px}
+  .note p{margin:6px 0}
+  .note ul{margin:6px 0;padding-left:20px}
+
+  pre{
+    margin:0;background:#0b0f14;border:1px solid var(--line);border-radius:9px;
+    padding:11px;font-family:var(--mono);font-size:12px;line-height:1.5;
+    overflow-x:auto;white-space:pre-wrap;word-break:break-word;color:#c9d6e2;
+    max-height:260px;overflow-y:auto;
+  }
+  .hint{color:var(--muted);font-size:12px;margin:8px 0 0}
+  .badge{
+    display:inline-block;font-size:11.5px;padding:2px 8px;border-radius:999px;
+    background:var(--panel-2);border:1px solid var(--line);color:var(--muted);
+    font-family:var(--mono);
+  }
+  .badge.ok{color:#9be8a8;border-color:rgba(63,185,80,.4);background:rgba(63,185,80,.1)}
+  .badge.err{color:#ffb3ad;border-color:rgba(248,81,73,.4);background:rgba(248,81,73,.1)}
+  details{margin-top:10px}
+  summary{cursor:pointer;color:var(--muted);font-size:13px;user-select:none}
+  [hidden]{display:none !important}
+  .sep{height:1px;background:var(--line);margin:12px 0}
+  .footer{color:#5b6673;font-size:11.5px;text-align:center;margin-top:20px;line-height:1.7}
+</style>
+</head>
+<body>
+
+<h1>墨水屏天气同步</h1>
+<p class="sub">ESP32-S3 · EPD 212×104 · BLE GATT（Nordic UART Service）· Open-Meteo 数据源</p>
+
+<!-- ============ 环境检测（不支持时整块显示） ============ -->
+<div id="envBlock" class="card" hidden></div>
+
+<!-- ============ 连接 ============ -->
+<div class="card">
+  <h2>1 · 连接设备</h2>
+
+  <div class="row">
+    <div class="state">
+      <span id="connDot" class="dot"></span>
+      <span id="connText">未连接</span>
+    </div>
+    <span id="connName" class="badge" hidden></span>
+  </div>
+
+  <div class="row">
+    <button id="btnConnect" class="primary">连接设备</button>
+    <button id="btnDisconnect" disabled class="ghost">断开</button>
+    <button id="btnStatus" disabled class="ghost">查询状态</button>
+  </div>
+
+  <div class="row">
+    <label class="chk">
+      <input type="checkbox" id="compat" />
+      兼容模式（设备未在广播里暴露 NUS UUID 时，列出全部 BLE 设备手动选）
+    </label>
+  </div>
+
+  <p class="hint">
+    设备名应为 <code>EPD-Weather</code>。若列表里看不到，先确认墨水屏已上电且固件在广播；
+    再试兼容模式。配对弹窗由浏览器控制（Chrome 里必须手动点选设备）。
+  </p>
+</div>
+
+<!-- ============ 同步 ============ -->
+<div class="card">
+  <h2>2 · 取天气并同步</h2>
+
+  <div class="row">
+    <input type="text" id="city" placeholder="输入城市，如 杭州 / Beijing" value="" autocomplete="off" />
+    <button id="btnSync" class="primary" disabled>取天气并同步</button>
+  </div>
+
+  <div class="row">
+    <button id="btnTestJson" disabled class="ghost">发送测试 JSON</button>
+    <button id="btnClear" class="ghost">清空日志</button>
+  </div>
+
+  <p class="hint">
+    城市先经 Open-Meteo Geocoding 转经纬度，再取当前天气 + 今日/明日高低温。
+    <code>desc</code> / <code>fc_desc</code> 会自动映射成 ≤16 字符的英文短词
+    （墨水屏字库仅 ASCII，写中文会显示成方框）。
+  </p>
+</div>
+
+<!-- ============ 结果 ============ -->
+<div class="card">
+  <h2>3 · 状态与排错</h2>
+
+  <dl class="kv">
+    <dt>最后同步</dt><dd id="metaLast">—</dd>
+    <dt>写入字节</dt><dd id="metaBytes">—</dd>
+    <dt>分片</dt><dd id="metaChunks">—</dd>
+    <dt>设备回执</dt><dd id="metaReply">—</dd>
+  </dl>
+
+  <div class="sep"></div>
+
+  <h2 style="margin-bottom:8px">即将写入的 JSON</h2>
+  <pre id="outPayload">（尚未生成）</pre>
+
+  <details>
+    <summary>原始天气 API 响应（排错用）</summary>
+    <pre id="outRaw" style="margin-top:8px">（尚未请求）</pre>
+  </details>
+
+  <details>
+    <summary>运行日志</summary>
+    <pre id="outLog" style="margin-top:8px">（空）</pre>
+  </details>
+</div>
+
+<p class="footer">
+  单文件客户端 · 无构建 · 无 CDN<br />
+  Chrome / Edge（桌面或 Android）· 需 https 或 localhost · iOS Safari 不支持
+</p>
+
+<script>
+"use strict";
+
+/* ============================================================================
+ * 1. 协议常量（与 ESP32 固件一致，不要改）
+ * ==========================================================================*/
+const NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"; // 服务
+const NUS_RX      = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // 手机 -> ESP32（write / writeWithoutResponse）
+const NUS_TX      = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // ESP32 -> 手机（notify）
+const CHUNK_SIZE  = 180;      // 每片字节数（MTU 500，留足余量）
+const MAX_PAYLOAD = 480;      // 单次 JSON 建议上限，超过会警告
+const REPLY_TIMEOUT = 3500;   // 等设备 notify 回执的超时（ms）
+
+/* ============================================================================
+ * 2. WMO weather_code -> ≤16 字符 ASCII 短描述（墨水屏字库只有 ASCII）
+ *    Open-Meteo 的 weather_code 就是 WMO 4677 标准码。
+ * ==========================================================================*/
+const WMO_DESC = {
+  0:  "Clear",
+  1:  "Mainly Clear",
+  2:  "Partly Cloudy",
+  3:  "Overcast",
+  45: "Fog",
+  48: "Rime Fog",
+  51: "Light Drizzle",
+  53: "Drizzle",
+  55: "Dense Drizzle",
+  56: "Frz Drizzle",
+  57: "Frz Drizzle",
+  61: "Light Rain",
+  63: "Rain",
+  65: "Heavy Rain",
+  66: "Frz Rain",
+  67: "Frz Rain",
+  71: "Light Snow",
+  73: "Snow",
+  75: "Heavy Snow",
+  77: "Snow Grains",
+  80: "Rain Showers",
+  81: "Showers",
+  82: "Heavy Showers",
+  85: "Snow Showers",
+  86: "Snow Showers",
+  95: "Thunderstorm",
+  96: "Tstorm Hail",
+  99: "Tstorm Hail"
+};
+
+/** 把 Open-Meteo 的 weather_code 转成英文短描述，未知码回退 "Unknown"。 */
+function wmoDesc(code) {
+  const d = WMO_DESC[code];
+  return (typeof d === "string") ? d : "Unknown";
+}
+
+/* ============================================================================
+ * 3. DOM 引用与小工具
+ * ==========================================================================*/
+const $ = (id) => document.getElementById(id);
+
+const el = {
+  envBlock: $("envBlock"),
+  connDot: $("connDot"), connText: $("connText"), connName: $("connName"),
+  btnConnect: $("btnConnect"), btnDisconnect: $("btnDisconnect"), btnStatus: $("btnStatus"),
+  compat: $("compat"),
+  city: $("city"), btnSync: $("btnSync"), btnTestJson: $("btnTestJson"), btnClear: $("btnClear"),
+  metaLast: $("metaLast"), metaBytes: $("metaBytes"), metaChunks: $("metaChunks"), metaReply: $("metaReply"),
+  outPayload: $("outPayload"), outRaw: $("outRaw"), outLog: $("outLog")
+};
+
+let logLines = [];
+/** 追加一行日志（页面上只保留最近 80 行，避免卡顿）。 */
+function log(msg) {
+  const t = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+  logLines.push(`[${t}] ${msg}`);
+  if (logLines.length > 80) logLines = logLines.slice(-80);
+  el.outLog.textContent = logLines.join("\n");
+  el.outLog.scrollTop = el.outLog.scrollHeight;
+}
+
+/** 整数安全转换：无效值返回 null（null 字段不会被写进 JSON，固件保留原值）。 */
+function safeInt(v) {
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.round(n) : null;
+}
+
+/** 把可能含非 ASCII / 过长的描述压到 ≤16 个 ASCII 字符。 */
+function safeDesc(s, fallback) {
+  let out = String(s == null ? "" : s)
+    .replace(/[^\x20-\x7E]/g, "")   // 去掉非 ASCII（中文会变方框）
+    .trim();
+  if (!out) out = fallback;
+  if (out.length > 16) out = out.slice(0, 16).trim();
+  return out;
+}
+
+/** UTF-8 字节长度（中文 3 字节，判断 payload 是否超 480 用）。 */
+function byteLen(str) { return new TextEncoder().encode(str).length; }
+
+/* ============================================================================
+ * 4. 环境能力检测：Web Bluetooth 可用性 / 安全上下文 / 已知不支持的浏览器
+ * ==========================================================================*/
+function detectEnv() {
+  const ua = navigator.userAgent;
+  const isIOS = /iPad|iPhone|iPod/.test(ua) ||
+                (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  const isSafari = /Safari/.test(ua) && !/Chrome|CriOS|Chromium|Edg|OPR|Android/.test(ua);
+  const isFirefox = /Firefox|FxiOS/.test(ua);
+  const isFile = location.protocol === "file:";
+  const isSecure = window.isSecureContext === true ||
+                   location.protocol === "https:" ||
+                   location.hostname === "localhost" ||
+                   location.hostname === "127.0.0.1";
+  const hasBT = typeof navigator.bluetooth !== "undefined" &&
+                typeof navigator.bluetooth.requestDevice === "function";
+
+  const probs = [];
+
+  if (!hasBT) {
+    if (isFile) {
+      probs.push({
+        level: "err",
+        title: "页面是用 file:// 直接打开的，Web Bluetooth 不会出现",
+        html: `<p>Web Bluetooth 只在<b>安全上下文</b>里暴露 <code>navigator.bluetooth</code>，
+               <code>file://</code> 不算安全上下文，所以打开就是 undefined。</p>
+               <p><b>解决（任选其一）：</b></p>
+               <ul>
+                 <li>在本 <code>web</code> 目录启动本地服务，然后访问 <code>http://localhost:8000</code>：<br />
+                     <code>python -m http.server 8000</code>（Windows 也可 <code>py -m http.server 8000</code>）</li>
+                 <li>把整个目录部署到 GitHub Pages / 任意 https 静态托管，用 https 地址访问。</li>
+                 <li>Chrome 地址栏直接输 <code>http://localhost:8000</code> 也算安全上下文。</li>
+               </ul>`
+      });
+    } else if (isIOS || isSafari) {
+      probs.push({
+        level: "err",
+        title: "iOS / Safari 不支持 Web Bluetooth",
+        html: `<p>Apple 的 WebKit 至今没有实现 Web Bluetooth，<b>iPhone / iPad 上的所有浏览器都是 Safari 内核</b>，
+               包括 iOS 版 Chrome、Edge、Firefox，也一样没有 <code>navigator.bluetooth</code>。</p>
+               <p><b>iPhone 用户的替代方案：</b></p>
+               <ul>
+                 <li>用 <b>微信小程序</b>（wx.openBluetoothAdapter 等 BLE API）—— 国内最顺路。</li>
+                 <li>用现成 App 手动发 JSON：<b>nRF Connect</b> / <b>LightBlue</b> / BLE 串口助手。</li>
+                 <li>改用 <b>Android 手机 + Chrome</b> 打开本页面。</li>
+               </ul>`
+      });
+    } else if (isFirefox) {
+      probs.push({
+        level: "err",
+        title: "Firefox 未实现 Web Bluetooth",
+        html: `<p>Mozilla 对 Web Bluetooth 的标准化立场是 harmful，默认不提供。
+               请换 <b>Chrome</b> 或 <b>Edge</b>（桌面版 / Android 版）打开本页面。</p>`
+      });
+    } else {
+      probs.push({
+        level: "err",
+        title: "当前浏览器没有 Web Bluetooth",
+        html: `<p>请用 <b>Chrome / Edge（桌面版或 Android 版）</b>打开。
+               部分 Linux / 旧版 Windows 需要在 <code>chrome://flags</code> 打开
+               <code>#experimental-web-platform-features</code>。</p>`
+      });
+    }
+  } else if (!isSecure) {
+    probs.push({
+      level: "warn",
+      title: "当前不是安全上下文，蓝牙调用可能被拒绝",
+      html: `<p>请用 https 地址，或改用 <code>http://localhost:8000</code> 访问。</p>`
+    });
+  }
+
+  // 有蓝牙能力，但仍是 iOS 上的“第三方浏览器”——理论上不该发生，做双保险提示
+  if (hasBT && isIOS) {
+    probs.push({
+      level: "warn",
+      title: "iOS 上检测到了 navigator.bluetooth（第三方扩展/内测特性）",
+      html: `<p>这可能来自用户自行安装的 Safari 扩展。官方 WebKit 不支持，行为不保证，建议改用微信小程序或 nRF Connect。</p>`
+    });
+  }
+
+  if (probs.length === 0) {
+    el.envBlock.hidden = true;
+    return;
+  }
+
+  el.envBlock.hidden = false;
+  const hasErr = probs.some(p => p.level === "err");
+  el.envBlock.innerHTML = probs.map(p =>
+    `<div class="note ${p.level}"><b>${p.title}</b>${p.html}</div>`
+  ).join('<div style="height:8px"></div>');
+
+  if (hasErr) {
+    el.btnConnect.disabled = true;
+    el.btnConnect.textContent = "当前环境不支持 BLE";
+  }
+}
+
+/* ============================================================================
+ * 5. BLE 连接状态
+ * ==========================================================================*/
+let btDevice = null;   // BluetoothDevice
+let btServer = null;   // BluetoothRemoteGATTServer
+let rxChar = null;     // 写入用
+let txChar = null;     // notify 用
+let notifyBuf = "";    // notify 字节流缓冲（按 \n 切行）
+const replyWaiters = []; // 等待回执的 Promise resolver 队列
+
+function setConn(state, text, name) {
+  el.connDot.className = "dot" + (state ? " " + state : "");
+  el.connText.textContent = text;
+  if (name) { el.connName.hidden = false; el.connName.textContent = name; }
+  else { el.connName.hidden = true; el.connName.textContent = ""; }
+}
+
+function setConnectedUI(connected) {
+  el.btnConnect.disabled = connected || el.btnConnect.dataset.blocked === "1";
+  el.btnDisconnect.disabled = !connected;
+  el.btnStatus.disabled = !connected;
+  el.btnSync.disabled = !connected;
+  el.btnTestJson.disabled = !connected;
+}
+
+/** 连接流程：requestDevice -> gatt.connect -> 取 RX/TX -> 订阅 notify。 */
+async function connectDevice() {
+  if (!navigator.bluetooth) return;
+
+  try {
+    setConn("wait", "正在选择设备…");
+    log("调用 navigator.bluetooth.requestDevice()");
+
+    // 正常模式：按 NUS Service 过滤（固件广播里带 UUID 时最省事）
+    // 兼容模式：列出全部 BLE 设备，靠名字/手动判断，再通过 optionalServices 拿权限
+    const options = el.compat.checked
+      ? { acceptAllDevices: true, optionalServices: [NUS_SERVICE] }
+      : { filters: [{ services: [NUS_SERVICE] }], optionalServices: [NUS_SERVICE] };
+
+    btDevice = await navigator.bluetooth.requestDevice(options);
+    log(`已选设备：${btDevice.name || "(无名)"} / id=${btDevice.id}`);
+
+    btDevice.addEventListener("gattserverdisconnected", onDisconnected);
+
+    setConn("wait", "正在连接 GATT…", btDevice.name);
+    btServer = await btDevice.gatt.connect();
+    log("GATT 已连接");
+
+    const service = await btServer.getPrimaryService(NUS_SERVICE);
+    log("拿到 NUS 服务");
+
+    rxChar = await service.getCharacteristic(NUS_RX);
+    txChar = await service.getCharacteristic(NUS_TX);
+    log(`RX properties: ${[...(rxChar.properties ? Object.keys(rxChar.properties).filter(k => rxChar.properties[k]) : [])].join(",")}`);
+
+    // 订阅 TX 通知（设备回执 / 状态查询回复都从这里来）
+    try {
+      await txChar.startNotifications();
+      txChar.addEventListener("characteristicvaluechanged", onNotify);
+      log("已订阅 TX notify");
+    } catch (e) {
+      log("⚠️ 订阅 TX notify 失败（写入仍可进行）：" + e.message);
+    }
+
+    setConn("on", "已连接", btDevice.name || "(无名设备)");
+    setConnectedUI(true);
+    log("连接完成，可以同步天气");
+  } catch (err) {
+    setConn("bad", "连接失败");
+    setConnectedUI(false);
+    // NotFoundError = 用户取消选择框，不算错误
+    if (err && err.name === "NotFoundError") log("已取消设备选择");
+    else log("❌ 连接失败：" + (err && err.message ? err.message : String(err)));
+    if (err && err.name === "NetworkError") {
+      log("提示：NetworkError 常见于设备已被别的 App 占用、或设备未在广播。断开手机蓝牙里其它连接后重试。");
+    }
+  }
+}
+
+function onDisconnected() {
+  log("设备已断开（gattserverdisconnected）");
+  setConn("bad", "已断开");
+  setConnectedUI(false);
+  rxChar = txChar = null;
+  btServer = null;
+}
+
+function disconnectDevice() {
+  try { if (btServer && btServer.connected) btServer.disconnect(); } catch (e) { /* ignore */ }
+  onDisconnected();
+}
+
+/* ============================================================================
+ * 6. notify 接收：按 \n 切行，逐行 parse JSON；有等待者就 resolve
+ * ==========================================================================*/
+function onNotify(event) {
+  const chunk = new TextDecoder("utf-8").decode(event.target.value);
+  notifyBuf += chunk;
+
+  let idx;
+  while ((idx = notifyBuf.indexOf("\n")) >= 0) {
+    const line = notifyBuf.slice(0, idx).trim();
+    notifyBuf = notifyBuf.slice(idx + 1);
+    if (!line) continue;
+    log("← 设备通知：" + line);
+
+    let parsed = null;
+    try { parsed = JSON.parse(line); } catch (e) { /* 非 JSON 也照样展示 */ }
+
+    el.metaReply.textContent = parsed ? JSON.stringify(parsed) : line;
+
+    // 唤醒第一个等待回执的调用
+    const w = replyWaiters.shift();
+    if (w) { clearTimeout(w.timer); w.resolve(parsed || line); }
+  }
+}
+
+/** 等待一条设备回执，超时返回 null（不抛错，便于 UI 继续走）。 */
+function waitReply(timeoutMs = REPLY_TIMEOUT) {
+  return new Promise((resolve) => {
+    const waiter = {
+      resolve,
+      timer: setTimeout(() => {
+        const i = replyWaiters.indexOf(waiter);
+        if (i >= 0) replyWaiters.splice(i, 1);
+        resolve(null);
+      }, timeoutMs)
+    };
+    replyWaiters.push(waiter);
+  });
+}
+
+/* ============================================================================
+ * 7. 分片写入：chunkSize = 180 字节，最后一片追加 '\n'
+ * ==========================================================================*/
+async function writeRawBytes(bytes) {
+  // 优先用 writeWithoutResponse（快，且 NUS 的 RX 一般两者都支持）
+  const props = rxChar.properties || {};
+  if (props.writeWithoutResponse && typeof rxChar.writeValueWithoutResponse === "function") {
+    await rxChar.writeValueWithoutResponse(bytes);
+  } else if (props.write && typeof rxChar.writeValueWithResponse === "function") {
+    await rxChar.writeValueWithResponse(bytes);
+  } else {
+    // 老实现只有 writeValue
+    await rxChar.writeValue(bytes);
+  }
+}
+
+/**
+ * 把一段文本按 180 字节分片写入 RX，最后一片末尾补 '\n'。
+ * 注意：UTF-8 多字节字符可能被切到两片之间——固件侧应该是“按字节攒到 \n 再整体解码”，
+ * 这里为了不切断汉字另外做了一步保护：切片边界若落在多字节字符中间，就把边界往前挪。
+ */
+async function writeChunked(text) {
+  const enc = new TextEncoder();
+  const all = enc.encode(text);
+  const slices = [];
+
+  let start = 0;
+  while (start < all.length) {
+    let end = Math.min(start + CHUNK_SIZE, all.length);
+    // 回退到字符边界：UTF-8 续字节形如 10xxxxxx，往前退到非续字节之后
+    if (end < all.length) {
+      let safeEnd = end;
+      while (safeEnd > start && (all[safeEnd] & 0xC0) === 0x80) safeEnd--;
+      if (safeEnd > start) end = safeEnd;
+    }
+    slices.push(all.slice(start, end));
+    start = end;
+  }
+  if (slices.length === 0) slices.push(new Uint8Array(0));
+
+  // 最后一片追加 '\n'；如果追加后会超过 CHUNK_SIZE，就单独再发一片 '\n'
+  const last = slices[slices.length - 1];
+  if (last.length + 1 <= CHUNK_SIZE) {
+    const withNl = new Uint8Array(last.length + 1);
+    withNl.set(last, 0);
+    withNl[last.length] = 0x0A; // '\n'
+    slices[slices.length - 1] = withNl;
+  } else {
+    slices.push(new Uint8Array([0x0A]));
+  }
+
+  for (let i = 0; i < slices.length; i++) {
+    await writeRawBytes(slices[i]);
+    log(`→ 分片 ${i + 1}/${slices.length}，${slices[i].length} 字节`);
+    // 无响应写之间稍作间隔，避免刷太快把设备协议栈顶掉
+    await new Promise(r => setTimeout(r, 25));
+  }
+  return slices.length;
+}
+
+/** 对外入口：写入一条完整 JSON 文本，返回 {bytes, chunks, reply}。 */
+async function sendJsonObject(obj) {
+  if (!rxChar) throw new Error("未连接设备或 RX 特征值不可用");
+
+  const text = JSON.stringify(obj);
+  const bytes = byteLen(text);
+  el.outPayload.textContent = text;
+  el.metaBytes.textContent = bytes + " 字节" + (bytes > MAX_PAYLOAD ? "（超过 480，建议精简）" : "");
+
+  const chunks = await writeChunked(text);
+  el.metaChunks.textContent = chunks + " 片 × ≤" + CHUNK_SIZE + " 字节";
+
+  const reply = await waitReply();
+  el.metaLast.textContent = new Date().toLocaleString("zh-CN", { hour12: false });
+  return { bytes, chunks, reply, text };
+}
+
+/* ============================================================================
+ * 8. 天气：Open-Meteo Geocoding + Forecast（都支持 CORS，无需 Key）
+ * ==========================================================================*/
+async function geocodeCity(name) {
+  const url = "https://geocoding-api.open-meteo.com/v1/search?name=" +
+              encodeURIComponent(name) + "&count=1&language=zh";
+  log("请求地理编码：" + url);
+
+  const res = await fetch(url, { method: "GET" });
+  if (!res.ok) throw new Error("地理编码请求失败 HTTP " + res.status);
+  const data = await res.json();
+  log("地理编码响应：" + JSON.stringify(data).slice(0, 400));
+  el.outRaw.textContent = JSON.stringify(data, null, 2);
+
+  // 查不到时 Open-Meteo 返回 200 且没有 results 字段（已实测）
+  const hit = data && Array.isArray(data.results) ? data.results[0] : null;
+  if (!hit) throw new Error(`没有找到城市「${name}」，换个说法或直接填英文/拼音试试`);
+
+  return {
+    name: hit.name,
+    admin: hit.admin1 || "",
+    country: hit.country || "",
+    lat: hit.latitude,
+    lon: hit.longitude,
+    timezone: hit.timezone || "auto"
+  };
+}
+
+async function fetchForecast(lat, lon) {
+  // current / daily 变量：基础 4 个 + uv_index（追加项，已实测可用）
+  const currentVars = "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,uv_index";
+  const dailyVars  = "temperature_2m_max,temperature_2m_min,weather_code,uv_index_max";
+
+  const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
+              `&current=${currentVars}&daily=${dailyVars}&timezone=auto&forecast_days=2`;
+  log("请求天气：" + url);
+
+  const res = await fetch(url, { method: "GET" });
+  if (!res.ok) throw new Error("天气请求失败 HTTP " + res.status);
+  const data = await res.json();
+  el.outRaw.textContent = JSON.stringify(data, null, 2);
+  log(`天气响应：current=${JSON.stringify(data.current)}`);
+  log(`daily.time=${JSON.stringify(data.daily && data.daily.time)}`);
+  return data;
+}
+
+/**
+ * 把 Open-Meteo 响应压成固件协议里的字段。
+ * 字段全部可选：拿不到的就不放进 JSON（固件会保留原值）。
+ */
+function buildPayload(city, wx) {
+  const cur = wx.current || {};
+  const daily = wx.daily || {};
+  const t = daily.time || [];
+  const tMax = daily.temperature_2m_max || [];
+  const tMin = daily.temperature_2m_min || [];
+  const dCode = daily.weather_code || [];
+
+  const payload = {};
+
+  const temp = safeInt(cur.temperature_2m);
+  if (temp !== null) payload.temp = temp;
+
+  const feels = safeInt(cur.apparent_temperature);
+  if (feels !== null) payload.feels = feels;
+
+  if (cur.weather_code !== undefined && cur.weather_code !== null) {
+    payload.desc = safeDesc(wmoDesc(cur.weather_code), "Unknown");
+  }
+
+  const hum = safeInt(cur.relative_humidity_2m);
+  if (hum !== null) payload.hum = hum;
+
+  const uv = safeInt(cur.uv_index);
+  if (uv !== null) payload.uv = uv;
+
+  // 今天的高低温 -> tlow / thigh
+  const lowToday = safeInt(tMin[0]);
+  const highToday = safeInt(tMax[0]);
+  if (lowToday !== null) payload.tlow = lowToday;
+  if (highToday !== null) payload.thigh = highToday;
+
+  // 明天（forecast_days=2 的第二条）-> fc_date / fc_desc / fc_low / fc_high
+  if (t[1]) {
+    // "2026-11-02" -> "11-02"，协议要求 MM-DD 且 ≤5 字符
+    const mmdd = String(t[1]).slice(5, 10);
+    if (/^\d{2}-\d{2}$/.test(mmdd)) payload.fc_date = mmdd;
+  }
+  if (dCode[1] !== undefined && dCode[1] !== null) {
+    payload.fc_desc = safeDesc(wmoDesc(dCode[1]), "Unknown");
+  }
+  const fcLow = safeInt(tMin[1]);
+  const fcHigh = safeInt(tMax[1]);
+  if (fcLow !== null) payload.fc_low = fcLow;
+  if (fcHigh !== null) payload.fc_high = fcHigh;
+
+  return { payload, city };
+}
+
+/** 主流程：城市 -> 经纬度 -> 天气 -> 组装 JSON -> 分片写入 -> 等回执。 */
+async function syncWeather() {
+  const cityName = (el.city.value || "").trim();
+  if (!cityName) { log("请先输入城市名"); el.city.focus(); return; }
+  if (!rxChar) { log("请先连接设备"); return; }
+
+  el.btnSync.disabled = true;
+  try {
+    localStorage.setItem("epd_city", cityName);
+
+    setConn("wait", "正在取天气…", btDevice ? btDevice.name : "");
+    const city = await geocodeCity(cityName);
+    log(`城市解析：${city.name} ${city.admin} ${city.country} (${city.lat}, ${city.lon})`);
+
+    const wx = await fetchForecast(city.lat, city.lon);
+    const { payload } = buildPayload(city, wx);
+
+    log("组装完成：" + JSON.stringify(payload));
+    if (payload.desc && payload.desc.length > 16) log("⚠️ desc 超过 16 字符");
+    if (payload.fc_desc && payload.fc_desc.length > 16) log("⚠️ fc_desc 超过 16 字符");
+
+    const result = await sendJsonObject(payload);
+    log(`写入完成：${result.bytes} 字节 / ${result.chunks} 片`);
+
+    if (result.reply && typeof result.reply === "object") {
+      log("设备回执：" + JSON.stringify(result.reply));
+      if (result.reply.ok === false) log("⚠️ 设备返回 ok=false，看 msg 字段");
+    } else if (result.reply === null) {
+      log("⚠️ 等待回执超时（写入可能已成功，设备不回执也不影响刷新）");
+    }
+
+    // 只在仍连着的时候刷新连接状态文案：如果中途被断开，就别把状态改回"已连接"
+    if (rxChar) setConn("on", "已连接 · 同步完成", btDevice ? btDevice.name : "");
+  } catch (err) {
+    log("❌ 同步失败：" + (err && err.message ? err.message : String(err)));
+    if (rxChar) setConn("on", "已连接 · 同步失败", btDevice ? btDevice.name : "");
+  } finally {
+    el.btnSync.disabled = !rxChar;
+  }
+}
+
+/* ============================================================================
+ * 9. 其它动作
+ * ==========================================================================*/
+async function queryStatus() {
+  if (!rxChar) return;
+  el.btnStatus.disabled = true;
+  try {
+    log("发送状态查询");
+    const r = await sendJsonObject({ cmd: "status" });
+    if (r.reply === null) log("⚠️ 状态查询无回执（检查 TX notify 是否订阅成功）");
+  } catch (err) {
+    log("❌ 状态查询失败：" + err.message);
+  } finally {
+    el.btnStatus.disabled = !rxChar;
+  }
+}
+
+/** 发一条最小测试 JSON，用来单独验证链路（不依赖网络）。 */
+async function sendTestJson() {
+  if (!rxChar) return;
+  el.btnTestJson.disabled = true;
+  try {
+    const demo = { temp: 23, feels: 25, desc: "Sunny", hum: 52, uv: 3,
+                   tlow: 18, thigh: 27, fc_date: "11-03", fc_desc: "Cloudy",
+                   fc_low: 16, fc_high: 24 };
+    log("发送测试 JSON（链路验证）");
+    const r = await sendJsonObject(demo);
+    log("测试结果：" + (r.reply === null ? "无回执" : JSON.stringify(r.reply)));
+  } catch (err) {
+    log("❌ 测试发送失败：" + err.message);
+  } finally {
+    el.btnTestJson.disabled = !rxChar;
+  }
+}
+
+/* ============================================================================
+ * 10. 事件绑定与初始化
+ * ==========================================================================*/
+el.btnConnect.addEventListener("click", connectDevice);
+el.btnDisconnect.addEventListener("click", disconnectDevice);
+el.btnStatus.addEventListener("click", queryStatus);
+el.btnSync.addEventListener("click", syncWeather);
+el.btnTestJson.addEventListener("click", sendTestJson);
+el.btnClear.addEventListener("click", () => {
+  logLines = [];
+  el.outLog.textContent = "（空）";
+  el.outPayload.textContent = "（尚未生成）";
+  el.outRaw.textContent = "（尚未请求）";
+  el.metaLast.textContent = "—";
+  el.metaBytes.textContent = "—";
+  el.metaChunks.textContent = "—";
+  el.metaReply.textContent = "—";
+});
+el.city.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && rxChar) syncWeather();
+});
+
+(function init() {
+  detectEnv();
+  if (el.btnConnect.disabled) el.btnConnect.dataset.blocked = "1";
+  setConn("", "未连接");
+  setConnectedUI(false);
+
+  // 记住上次用的城市，手机端少打点字
+  try {
+    const saved = localStorage.getItem("epd_city");
+    if (saved) el.city.value = saved;
+  } catch (e) { /* 隐私模式禁 localStorage，忽略 */ }
+
+  log("页面已就绪。协议：NUS / RX 写 / TX notify；分片 " + CHUNK_SIZE + " 字节。");
+  log("天气源：Open-Meteo（支持 CORS，无需 Key）。");
+})();
+</script>
+</body>
+</html>
